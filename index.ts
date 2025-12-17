@@ -1,119 +1,133 @@
 /*
- * TenGuard – Vencord Plugin
- * Auto return to voice + detect mover + notify & DM
- * SPDX-License-Identifier: GPL-3.0-or-later
+ * TenGuard Ultimate – Vencord Plugin
+ * Auto return + detect mover + ignore + settings
  */
 
 import definePlugin, { OptionType } from "@utils/types";
 import { definePluginSettings } from "@api/Settings";
-import { findStoreLazy } from "@webpack";
 import { ChannelStore, RestAPI, Toasts, UserStore } from "@webpack/common";
 
 interface VoiceState {
     userId: string;
     channelId?: string | null;
-    oldChannelId?: string | null;
 }
-
-const VoiceStateStore = findStoreLazy("VoiceStateStore");
 
 const settings = definePluginSettings({
     enabled: {
         type: OptionType.BOOLEAN,
-        description: "Enable TenGuard",
+        description: "تشغيل البلوقن",
         default: true
     },
     autoReturn: {
         type: OptionType.BOOLEAN,
-        description: "Auto return to your last voice channel",
+        description: "الرجوع التلقائي للروم",
         default: true
     },
-    notify: {
+    showToast: {
         type: OptionType.BOOLEAN,
-        description: "Show notification when someone moves you",
+        description: "إظهار تنبيه",
         default: true
     },
-    dmMover: {
+    sendDM: {
         type: OptionType.BOOLEAN,
-        description: "Send DM to the person who moved you",
+        description: "إرسال رسالة للي سحبك",
         default: true
     },
     message: {
         type: OptionType.STRING,
-        description: "DM message sent to the mover",
-        default: "😂 Nice try — TenGuard returned me instantly."
+        description: "نص الرسالة",
+        default: "😂 Nice try — TenGuard رجعني مباشرة."
+    },
+    ignoreUserId: {
+        type: OptionType.STRING,
+        description: "Ignore User ID (اختياري)",
+        default: ""
     }
 });
 
-let lastChannelId: string | null = null;
 let myId: string | null = null;
+let lastChannelId: string | null = null;
+let loopTimer: NodeJS.Timeout | null = null;
 
-async function sendDM(userId: string, content: string) {
-    try {
-        const dm = await RestAPI.post({
-            url: "/users/@me/channels",
-            body: { recipient_id: userId }
-        }) as any;
+function startReturnLoop(guildId: string, channelId: string) {
+    if (loopTimer) return;
 
-        const dmId = dm?.body?.id;
-        if (!dmId) return;
+    let tries = 0;
 
-        await RestAPI.post({
-            url: `/channels/${dmId}/messages`,
-            body: { content }
-        });
-    } catch {
-        // ignore
+    loopTimer = setInterval(() => {
+        tries++;
+
+        RestAPI.patch({
+            url: `/guilds/${guildId}/members/${myId}`,
+            body: { channel_id: channelId }
+        }).catch(() => {});
+
+        if (tries >= 20) stopReturnLoop(); // 10 ثواني
+    }, 500);
+}
+
+function stopReturnLoop() {
+    if (loopTimer) {
+        clearInterval(loopTimer);
+        loopTimer = null;
     }
 }
 
-async function findMoverAndNotify(
+async function findMoverAndReact(
     guildId: string,
     victimId: string,
-    previousChannelId: string
+    channelId: string
 ) {
     try {
-        const res = await RestAPI.get({
+        const { body } = await RestAPI.get({
             url: `/guilds/${guildId}/audit-logs`,
-            query: {
-                limit: 10,
-                action_type: 24 // MEMBER_MOVE
-            }
-        }) as any;
+            query: { limit: 10, action_type: 24 }
+        } as any);
 
-        const entries: any[] =
-            res?.body?.audit_log_entries ??
-            res?.body?.auditLogEntries ??
-            [];
+        const entries = body?.audit_log_entries ?? [];
+        const entry = entries.find((e: any) =>
+            String(e.target_id) === String(victimId)
+        );
 
-        const entry = entries.find(e => String(e.target_id) === String(victimId));
         if (!entry) return;
 
         const moverId = entry.user_id;
         if (!moverId) return;
 
-        const mover = UserStore.getUser(moverId);
-        const channel = ChannelStore.getChannel(previousChannelId);
+        if (settings.store.ignoreUserId &&
+            moverId === settings.store.ignoreUserId
+        ) return;
 
-        if (settings.store.notify) {
+        const mover = UserStore.getUser(moverId);
+        const channel = ChannelStore.getChannel(channelId);
+
+        if (settings.store.showToast) {
             Toasts.show({
-                id: Toasts.genId(),
                 type: Toasts.Type.INFO,
-                message: `TenGuard: ${mover?.username ?? moverId} tried to move you from ${channel?.name ?? "voice channel"}.`
+                id: Toasts.genId(),
+                message: `TenGuard: ${mover?.username ?? moverId} حاول يسحبك من ${channel?.name ?? "روم صوتي"}`
             });
         }
 
-        if (settings.store.dmMover) {
-            await sendDM(moverId, settings.store.message);
+        if (settings.store.sendDM) {
+            const dm = await RestAPI.post({
+                url: "/users/@me/channels",
+                body: { recipient_id: moverId }
+            } as any);
+
+            await RestAPI.post({
+                url: `/channels/${dm.body.id}/messages`,
+                body: { content: settings.store.message }
+            });
         }
     } catch {
-        // no permission / rate limit
+        // Ignore
     }
 }
 
 export default definePlugin({
-    name: "TenGuard",
-    description: "Auto return to voice, detect who moved you, notify & DM them",
+    name: "TenGuardUltimate",
+    description: "Ultimate anti-move voice guard",
     authors: [{ name: "Ryan" }],
     settings,
 
@@ -121,22 +135,27 @@ export default definePlugin({
         myId = UserStore.getCurrentUser()?.id ?? null;
     },
 
+    stop() {
+        stopReturnLoop();
+        lastChannelId = null;
+    },
+
     flux: {
         VOICE_STATE_UPDATES({ voiceStates }: { voiceStates: VoiceState[] }) {
             if (!settings.store.enabled) return;
+            if (!settings.store.autoReturn) return;
             if (!myId) return;
 
             for (const state of voiceStates) {
                 if (state.userId !== myId) continue;
 
-                // Joined / moved normally
                 if (state.channelId) {
                     lastChannelId = state.channelId;
-                    continue;
+                    stopReturnLoop();
+                    return;
                 }
 
-                // Removed / disconnected
-                if (!state.channelId && lastChannelId && settings.store.autoReturn) {
+                if (!state.channelId && lastChannelId) {
                     const channel = ChannelStore.getChannel(lastChannelId);
                     const guildId =
                         (channel as any)?.guild_id ??
@@ -144,14 +163,8 @@ export default definePlugin({
 
                     if (!guildId) return;
 
-                    // Instant return
-                    RestAPI.patch({
-                        url: `/guilds/${guildId}/members/${myId}`,
-                        body: { channel_id: lastChannelId }
-                    }).catch(() => {});
-
-                    // Detect mover
-                    void findMoverAndNotify(guildId, myId, lastChannelId);
+                    startReturnLoop(guildId, lastChannelId);
+                    void findMoverAndReact(guildId, myId, lastChannelId);
                 }
             }
         }
