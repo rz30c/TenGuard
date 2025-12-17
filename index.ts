@@ -1,78 +1,124 @@
 /*
- * 10 Guard - Vencord Plugin
- * Auto return to voice + detect who moved you
+ * TenGuard – Vencord Plugin
+ * Auto return to voice + detect mover + notify & DM
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 import definePlugin, { OptionType } from "@utils/types";
 import { definePluginSettings } from "@api/Settings";
 import { findStoreLazy } from "@webpack";
-import { RestAPI, UserStore } from "@webpack/common";
+import { ChannelStore, RestAPI, Toasts, UserStore } from "@webpack/common";
 
 interface VoiceState {
     userId: string;
-    channelId?: string;
-    oldChannelId?: string;
+    channelId?: string | null;
+    oldChannelId?: string | null;
 }
 
-interface VoiceStateStore {
-    getAllVoiceStates(): Record<string, Record<string, VoiceState>>;
-}
+const VoiceStateStore = findStoreLazy("VoiceStateStore");
 
-const VoiceStateStore: VoiceStateStore = findStoreLazy("VoiceStateStore");
-
-// ===== Settings =====
 const settings = definePluginSettings({
     enabled: {
         type: OptionType.BOOLEAN,
-        description: "Enable / Disable 10 Guard",
+        description: "Enable TenGuard",
+        default: true
+    },
+    autoReturn: {
+        type: OptionType.BOOLEAN,
+        description: "Auto return to your last voice channel",
+        default: true
+    },
+    notify: {
+        type: OptionType.BOOLEAN,
+        description: "Show notification when someone moves you",
+        default: true
+    },
+    dmMover: {
+        type: OptionType.BOOLEAN,
+        description: "Send DM to the person who moved you",
         default: true
     },
     message: {
         type: OptionType.STRING,
-        description: "Message sent to the user who tries to move you",
-        default: "😂 Nice try — 10 Guard returned me instantly."
+        description: "DM message sent to the mover",
+        default: "😂 Nice try — TenGuard returned me instantly."
     }
 });
 
 let lastChannelId: string | null = null;
 let myId: string | null = null;
 
-function getMyChannel(): string | null {
-    if (!myId) return null;
+async function sendDM(userId: string, content: string) {
+    try {
+        const dm = await RestAPI.post({
+            url: "/users/@me/channels",
+            body: { recipient_id: userId }
+        }) as any;
 
-    const states = VoiceStateStore.getAllVoiceStates();
-    for (const guild of Object.values(states)) {
-        if (guild[myId]?.channelId) {
-            return guild[myId].channelId!;
-        }
+        const dmId = dm?.body?.id;
+        if (!dmId) return;
+
+        await RestAPI.post({
+            url: `/channels/${dmId}/messages`,
+            body: { content }
+        });
+    } catch {
+        // ignore
     }
-    return null;
 }
 
-function sendDM(userId: string, content: string) {
-    RestAPI.post({
-        url: "/users/@me/channels",
-        body: { recipient_id: userId }
-    })
-        .then((res: any) => {
-            RestAPI.post({
-                url: `/channels/${res.body.id}/messages`,
-                body: { content }
+async function findMoverAndNotify(
+    guildId: string,
+    victimId: string,
+    previousChannelId: string
+) {
+    try {
+        const res = await RestAPI.get({
+            url: `/guilds/${guildId}/audit-logs`,
+            query: {
+                limit: 10,
+                action_type: 24 // MEMBER_MOVE
+            }
+        }) as any;
+
+        const entries: any[] =
+            res?.body?.audit_log_entries ??
+            res?.body?.auditLogEntries ??
+            [];
+
+        const entry = entries.find(e => String(e.target_id) === String(victimId));
+        if (!entry) return;
+
+        const moverId = entry.user_id;
+        if (!moverId) return;
+
+        const mover = UserStore.getUser(moverId);
+        const channel = ChannelStore.getChannel(previousChannelId);
+
+        if (settings.store.notify) {
+            Toasts.show({
+                id: Toasts.genId(),
+                type: Toasts.Type.INFO,
+                message: `TenGuard: ${mover?.username ?? moverId} tried to move you from ${channel?.name ?? "voice channel"}.`
             });
-        })
-        .catch(() => {});
+        }
+
+        if (settings.store.dmMover) {
+            await sendDM(moverId, settings.store.message);
+        }
+    } catch {
+        // no permission / rate limit
+    }
 }
 
 export default definePlugin({
-    name: "10 Guard",
-    description: "Auto return to voice channel and notify who tried to move you",
-    authors: [{ name: "10" }],
+    name: "TenGuard",
+    description: "Auto return to voice, detect who moved you, notify & DM them",
+    authors: [{ name: "Ryan" }],
     settings,
 
     start() {
         myId = UserStore.getCurrentUser()?.id ?? null;
-        lastChannelId = getMyChannel();
-        console.log("[10 Guard] Enabled 🛡️");
     },
 
     flux: {
@@ -81,38 +127,33 @@ export default definePlugin({
             if (!myId) return;
 
             for (const state of voiceStates) {
+                if (state.userId !== myId) continue;
 
-                // أنت
-                if (state.userId === myId) {
-                    if (state.channelId) {
-                        lastChannelId = state.channelId;
-                    } else if (!state.channelId && lastChannelId) {
-                        const guilds = VoiceStateStore.getAllVoiceStates();
-
-                        for (const [guildId] of Object.entries(guilds)) {
-                            RestAPI.patch({
-                                url: `/guilds/${guildId}/members/${myId}`,
-                                body: { channel_id: lastChannelId }
-                            }).catch(() => {});
-                        }
-                    }
+                // Joined / moved normally
+                if (state.channelId) {
+                    lastChannelId = state.channelId;
+                    continue;
                 }
 
-                // الشخص اللي حاول يسحبك
-                if (
-                    state.userId !== myId &&
-                    state.oldChannelId === lastChannelId &&
-                    !state.channelId
-                ) {
-                    sendDM(state.userId, settings.store.message);
+                // Removed / disconnected
+                if (!state.channelId && lastChannelId && settings.store.autoReturn) {
+                    const channel = ChannelStore.getChannel(lastChannelId);
+                    const guildId =
+                        (channel as any)?.guild_id ??
+                        (channel as any)?.guildId;
+
+                    if (!guildId) return;
+
+                    // Instant return
+                    RestAPI.patch({
+                        url: `/guilds/${guildId}/members/${myId}`,
+                        body: { channel_id: lastChannelId }
+                    }).catch(() => {});
+
+                    // Detect mover
+                    void findMoverAndNotify(guildId, myId, lastChannelId);
                 }
             }
         }
-    },
-
-    stop() {
-        console.log("[10 Guard] Disabled ❌");
-        lastChannelId = null;
-        myId = null;
     }
 });
